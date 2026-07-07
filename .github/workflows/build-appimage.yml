@@ -61,23 +61,27 @@ jobs:
           # appimagetool sie und bricht ggf. ab)
           rm -rf AppDir/usr/share/metainfo
 
-      - name: Mit klassischer Runtime neu packen
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: '1'
-          ARCH: x86_64
+      - name: Mit klassischer Runtime + gzip neu packen
         run: |
-          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
-          chmod +x appimagetool
           # Klassische, weit verbreitete fuse2-Type-2-Runtime (~185 KB), die
           # auch das ältere libappimage/AppImageLauncher registrieren kann.
           wget -q https://github.com/AppImage/AppImageKit/releases/download/13/obsolete-runtime-x86_64 -O runtime-x86_64
           test -s runtime-x86_64
+          # Type-2-Magic (AI\x02 an Offset 8) muss in der Runtime stehen
+          python3 -c "import sys; d=open('runtime-x86_64','rb').read(11); sys.exit(0 if d[8:11]==bytes([0x41,0x49,0x02]) else 1)" \
+            || { echo "Runtime ohne AppImage-Magic"; exit 1; }
+
           mkdir -p out
-          # WICHTIG: --comp gzip statt des neuen zstd, weil das ältere
-          # libappimage/AppImageLauncher kein zstd-SquashFS lesen kann.
-          ./appimagetool --comp gzip --runtime-file runtime-x86_64 AppDir out/Kopierer-x86_64.AppImage
+          # SquashFS mit dem SYSTEM-mksquashfs bauen (kann gzip; das in
+          # appimagetool eingebettete mksquashfs kann nur zstd, das libappimage
+          # in AppImageLauncher aber nicht lesen).
+          rm -f app.sqfs
+          mksquashfs AppDir app.sqfs -root-owned -noappend -comp gzip -b 128K -no-progress
+          # Klassisches AppImage = Runtime + angehängtes SquashFS
+          cat runtime-x86_64 app.sqfs > out/Kopierer-x86_64.AppImage
           chmod +x out/Kopierer-x86_64.AppImage
           ls -la out/
+
           echo "--- Kontrolle: SquashFS-Kompression muss gzip sein ---"
           OFF=$(for O in $(grep -aboP '\x68\x73\x71\x73' out/Kopierer-x86_64.AppImage | cut -d: -f1); do \
                   if unsquashfs -s -o "$O" out/Kopierer-x86_64.AppImage >/dev/null 2>&1; then echo "$O"; break; fi; done)
