@@ -68,8 +68,10 @@ jobs:
         run: |
           wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
           chmod +x appimagetool
-          # Klassische, weit verbreitete Type-2-Runtime (~187 KB)
-          wget -q https://github.com/AppImage/AppImageKit/releases/download/13/runtime-x86_64 -O runtime-x86_64
+          # Klassische, weit verbreitete fuse2-Type-2-Runtime (~185 KB), die
+          # auch das ältere libappimage/AppImageLauncher registrieren kann.
+          wget -q https://github.com/AppImage/AppImageKit/releases/download/13/obsolete-runtime-x86_64 -O runtime-x86_64
+          test -s runtime-x86_64
           mkdir -p out
           ./appimagetool --runtime-file runtime-x86_64 AppDir out/Kopierer-x86_64.AppImage
           chmod +x out/Kopierer-x86_64.AppImage
