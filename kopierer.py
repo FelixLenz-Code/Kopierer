@@ -21,13 +21,13 @@ import subprocess
 
 import img2pdf
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QSettings
 from PyQt5.QtGui import QPixmap, QIcon, QImage
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox,
     QSpinBox, QListWidget, QListWidgetItem, QVBoxLayout, QHBoxLayout,
     QFormLayout, QGroupBox, QScrollArea, QFileDialog, QMessageBox,
-    QProgressBar, QFrame, QSizePolicy, QStyle,
+    QProgressBar, QFrame, QSizePolicy, QStyle, QTabWidget,
 )
 
 # --- Papiergrößen in Millimetern (Breite x Höhe) ---------------------------
@@ -122,6 +122,20 @@ class ScanWorker(QThread):
 
             if proc.returncode != 0 or not os.path.getsize(self.out_path):
                 raise RuntimeError(err or f"scanimage endete mit Code {proc.returncode}")
+
+            # scanimage schreibt keine DPI-Information ins PNG. Ohne sie nimmt
+            # img2pdf 96 dpi an, wodurch Druck/PDF unabhängig von der gewählten
+            # Auflösung gleich aussehen. Wir betten die Scan-Auflösung ein, damit
+            # die Seite physikalisch korrekt (z. B. A4) und höhere dpi = schärfer.
+            try:
+                from PIL import Image
+                dpi = int(self.resolution)
+                im = Image.open(self.out_path)
+                im.load()
+                im.save(self.out_path, dpi=(dpi, dpi))
+            except (ValueError, OSError):
+                pass   # 'auto' o. Ä.: dann eben ohne DPI-Einbettung
+
             self.progress.emit(100)
             self.finished_ok.emit(self.out_path)
         except Exception as e:
@@ -214,16 +228,17 @@ class ThumbnailList(QListWidget):
             return
         src_row = self.row(src_item)
 
-        # Zielposition anhand der Cursorposition bestimmen
-        pos = event.pos()
-        idx = self.indexAt(pos)
-        if idx.isValid():
-            target_row = idx.row()
-            rect = self.visualRect(idx)
-            if pos.x() > rect.center().x():
-                target_row += 1
-        else:
-            target_row = self.count()
+        # Zielposition robust bestimmen: erste Seite, deren Mitte rechts vom
+        # Cursor liegt -> davor einfügen. (indexAt() liefert am linken Rand /
+        # in Lücken einen ungültigen Index, wodurch "Seite 2 vor Seite 1"
+        # fälschlich ans Ende sprang.)
+        x = event.pos().x()
+        target_row = self.count()
+        for i in range(self.count()):
+            rect = self.visualItemRect(self.item(i))
+            if x < rect.center().x():
+                target_row = i
+                break
 
         # Index nach dem Entnehmen korrigieren
         if target_row > src_row:
@@ -253,6 +268,9 @@ class Kopierer(QMainWindow):
         self.scan_worker = None
         self.print_worker = None
         self._pending_quick = False   # True -> nach dem Scan sofort drucken
+
+        self.settings = QSettings("Kopierer", "Kopierer")
+        self._loading_settings = False   # Guard gegen Signal-Rückkopplung
 
         self._ensure_assets()
         self._build_ui()
@@ -293,7 +311,6 @@ class Kopierer(QMainWindow):
     # -- UI-Aufbau ----------------------------------------------------------
     def _build_ui(self):
         central = QWidget()
-        self.setCentralWidget(central)
         root = QHBoxLayout(central)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(14)
@@ -436,7 +453,51 @@ class Kopierer(QMainWindow):
 
         root.addLayout(right, stretch=1)
 
+        # ---- Reiter: Kopierer + Einstellungen ----
+        self.tabs = QTabWidget()
+        self.tabs.addTab(central, "Kopierer")
+        self.tabs.addTab(self._build_settings_tab(), "Einstellungen")
+        self.setCentralWidget(self.tabs)
+
         self._update_actions()
+
+    def _build_settings_tab(self):
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(16)
+
+        title = QLabel("Einstellungen")
+        title.setObjectName("appTitle")
+        lay.addWidget(title)
+
+        box = QGroupBox("Standardgeräte")
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(12)
+
+        self.def_scanner_combo = QComboBox()
+        self.def_scanner_combo.setMinimumWidth(360)
+        self.def_printer_combo = QComboBox()
+        self.def_printer_combo.setMinimumWidth(360)
+        form.addRow("Standard-Scanner:", self.def_scanner_combo)
+        form.addRow("Standard-Drucker:", self.def_printer_combo)
+        lay.addWidget(box)
+
+        hint = QLabel("Diese Auswahl wird gespeichert und beim nächsten Start "
+                      "automatisch verwendet.")
+        hint.setObjectName("status")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addStretch(1)
+
+        self.def_scanner_combo.currentIndexChanged.connect(
+            self._on_default_scanner_changed)
+        self.def_printer_combo.currentIndexChanged.connect(
+            self._on_default_printer_changed)
+        return page
 
     def _apply_style(self):
         down = self.arrow_down.replace("\\", "/")
@@ -447,6 +508,18 @@ class Kopierer(QMainWindow):
                 font-size: 13px; }}
             #appTitle {{ font-size: 24px; font-weight: 700; color: #ffffff;
                 padding: 2px 0 6px 2px; }}
+
+            /* --- Reiter --- */
+            QTabWidget::pane {{ border: 0; }}
+            QTabBar {{ qproperty-drawBase: 0; }}
+            QTabBar::tab {{ background: #262b3b; color: #9aa4bf;
+                padding: 9px 28px; margin-right: 4px; font-weight: 600;
+                min-width: 90px;
+                border: 1px solid #333a4d; border-bottom: 0;
+                border-top-left-radius: 9px; border-top-right-radius: 9px; }}
+            QTabBar::tab:selected {{ background: #4a6cf7; color: #ffffff;
+                border-color: #4a6cf7; }}
+            QTabBar::tab:hover:!selected {{ background: #313849; color: #e6e9f0; }}
 
             /* --- Gruppenrahmen --- */
             QGroupBox {{ border: 1px solid #333a4d; border-radius: 10px;
@@ -546,21 +619,35 @@ class Kopierer(QMainWindow):
         self.dev_worker.start()
 
     def _on_devices_found(self, devices):
+        self._loading_settings = True
         self.device_combo.clear()
+        self.def_scanner_combo.clear()
         if not devices:
             self.device_combo.addItem("Kein Scanner gefunden", None)
+            self.def_scanner_combo.addItem("Kein Scanner gefunden", None)
             self.device_combo.setEnabled(False)
+            self.def_scanner_combo.setEnabled(False)
             self.set_status("Kein Scanner gefunden. Ist das Gerät angeschlossen?")
         else:
             for dev_id, desc in devices:
-                self.device_combo.addItem(f"{desc}", dev_id)
-            # Canon bevorzugt vorauswählen
-            for i, (dev_id, _) in enumerate(devices):
-                if "pixma" in dev_id.lower() or "canon" in dev_id.lower():
-                    self.device_combo.setCurrentIndex(i)
-                    break
+                self.device_combo.addItem(desc, dev_id)
+                self.def_scanner_combo.addItem(desc, dev_id)
+            # Gespeicherten Standard anwenden, sonst Canon bevorzugen
+            saved = self.settings.value("default_scanner", "")
+            idx = self.device_combo.findData(saved) if saved else -1
+            if idx < 0:
+                for i, (dev_id, _) in enumerate(devices):
+                    if "pixma" in dev_id.lower() or "canon" in dev_id.lower():
+                        idx = i
+                        break
+            if idx < 0:
+                idx = 0
+            self.device_combo.setCurrentIndex(idx)
+            self.def_scanner_combo.setCurrentIndex(idx)
             self.device_combo.setEnabled(True)
+            self.def_scanner_combo.setEnabled(True)
             self.set_status("Scanner bereit.")
+        self._loading_settings = False
         self._update_actions()
 
     def _load_printers(self):
@@ -570,21 +657,56 @@ class Kopierer(QMainWindow):
             printers = re.findall(r"^(?:Drucker|printer)\s+(\S+)", out, re.MULTILINE)
         except Exception:
             printers = []
+        self._loading_settings = True
         self.printer_combo.clear()
+        self.def_printer_combo.clear()
         if printers:
             self.printer_combo.addItems(printers)
-            # Standarddrucker markieren
-            try:
-                default = subprocess.run(["lpstat", "-d"], capture_output=True,
-                                         text=True, timeout=10).stdout
-                m = re.search(r":\s*(\S+)", default)
-                if m and m.group(1) in printers:
-                    self.printer_combo.setCurrentText(m.group(1))
-            except Exception:
-                pass
+            self.def_printer_combo.addItems(printers)
+            # Gespeicherten Standard bevorzugen, sonst CUPS-Standarddrucker
+            target = self.settings.value("default_printer", "")
+            if target not in printers:
+                target = ""
+                try:
+                    default = subprocess.run(["lpstat", "-d"], capture_output=True,
+                                             text=True, timeout=10).stdout
+                    m = re.search(r":\s*(\S+)", default)
+                    if m and m.group(1) in printers:
+                        target = m.group(1)
+                except Exception:
+                    pass
+            if target:
+                self.printer_combo.setCurrentText(target)
+                self.def_printer_combo.setCurrentText(target)
         else:
             self.printer_combo.addItem("Kein Drucker gefunden")
+            self.def_printer_combo.addItem("Kein Drucker gefunden")
             self.printer_combo.setEnabled(False)
+            self.def_printer_combo.setEnabled(False)
+        self._loading_settings = False
+
+    # -- Standardgeräte (Einstellungen) -------------------------------------
+    def _on_default_scanner_changed(self, _idx):
+        if self._loading_settings:
+            return
+        dev = self.def_scanner_combo.currentData()
+        if dev:
+            self.settings.setValue("default_scanner", dev)
+            i = self.device_combo.findData(dev)
+            if i >= 0:
+                self.device_combo.setCurrentIndex(i)
+            self.set_status("Standard-Scanner gespeichert.")
+
+    def _on_default_printer_changed(self, _idx):
+        if self._loading_settings:
+            return
+        name = self.def_printer_combo.currentText()
+        if name and self.def_printer_combo.isEnabled():
+            self.settings.setValue("default_printer", name)
+            i = self.printer_combo.findText(name)
+            if i >= 0:
+                self.printer_combo.setCurrentIndex(i)
+            self.set_status("Standard-Drucker gespeichert.")
 
     # -- Scannen ------------------------------------------------------------
     def start_scan(self):
