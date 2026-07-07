@@ -73,11 +73,17 @@ jobs:
           wget -q https://github.com/AppImage/AppImageKit/releases/download/13/obsolete-runtime-x86_64 -O runtime-x86_64
           test -s runtime-x86_64
           mkdir -p out
-          ./appimagetool --runtime-file runtime-x86_64 AppDir out/Kopierer-x86_64.AppImage
+          # WICHTIG: --comp gzip statt des neuen zstd, weil das ältere
+          # libappimage/AppImageLauncher kein zstd-SquashFS lesen kann.
+          ./appimagetool --comp gzip --runtime-file runtime-x86_64 AppDir out/Kopierer-x86_64.AppImage
           chmod +x out/Kopierer-x86_64.AppImage
           ls -la out/
-          echo "--- SquashFS-Offset der neuen Datei (sollte klein sein) ---"
-          grep -aboP '\x68\x73\x71\x73' out/Kopierer-x86_64.AppImage | head -1
+          echo "--- Kontrolle: SquashFS-Kompression muss gzip sein ---"
+          OFF=$(for O in $(grep -aboP '\x68\x73\x71\x73' out/Kopierer-x86_64.AppImage | cut -d: -f1); do \
+                  if unsquashfs -s -o "$O" out/Kopierer-x86_64.AppImage >/dev/null 2>&1; then echo "$O"; break; fi; done)
+          unsquashfs -s -o "$OFF" out/Kopierer-x86_64.AppImage | grep -i compression
+          unsquashfs -s -o "$OFF" out/Kopierer-x86_64.AppImage | grep -iq "compression gzip" \
+            || { echo "FEHLER: nicht gzip komprimiert"; exit 1; }
 
       - name: Als Artefakt hochladen
         uses: actions/upload-artifact@v4
@@ -93,11 +99,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete continuous --yes --cleanup-tag 2>/dev/null || true
-          gh release create continuous out/Kopierer-x86_64.AppImage \
-            --title "Continuous build (main)" \
-            --notes "Automatischer AppImage-Build vom neuesten main-Stand (Commit ${GITHUB_SHA:0:7})." \
-            --prerelease --target "$GITHUB_SHA"
+          NOTES="Automatischer AppImage-Build vom neuesten main-Stand (Commit ${GITHUB_SHA:0:7})."
+          if gh release view continuous >/dev/null 2>&1; then
+            # Release existiert -> nur Asset ersetzen und Notiz aktualisieren
+            # (kein Löschen -> nie ein Zustand mit Tag ohne Release)
+            gh release upload continuous out/Kopierer-x86_64.AppImage --clobber
+            gh release edit continuous --title "Continuous build (main)" --notes "$NOTES" --prerelease=false --latest
+          else
+            gh release create continuous out/Kopierer-x86_64.AppImage \
+              --title "Continuous build (main)" --notes "$NOTES" --target "$GITHUB_SHA"
+          fi
 
       - name: Versions-Release (bei v*-Tag)
         if: startsWith(github.ref, 'refs/tags/v')
