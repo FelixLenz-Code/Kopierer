@@ -39,6 +39,14 @@ PAGE_SIZES = {
     "Ganze Fläche":          (216.069, 297.011),
 }
 
+# Zuordnung Format -> CUPS-Medienname (für `lp -o media=...`)
+CUPS_MEDIA = {
+    "A4 (210 × 297 mm)":     "A4",
+    "A5 (148 × 210 mm)":     "A5",
+    "Letter (216 × 279 mm)": "Letter",
+    "Ganze Fläche":          "A4",
+}
+
 RESOLUTIONS = ["150", "300", "600", "1200"]
 
 SCAN_MODES = {
@@ -147,14 +155,18 @@ class PrintWorker(QThread):
     finished_ok = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, pdf_path, printer, copies):
+    def __init__(self, pdf_path, printer, copies, options=None):
         super().__init__()
         self.pdf_path = pdf_path
         self.printer = printer
         self.copies = copies
+        self.options = options or []
 
     def run(self):
-        cmd = ["lp", "-d", self.printer, "-n", str(self.copies), self.pdf_path]
+        cmd = ["lp", "-d", self.printer, "-n", str(self.copies)]
+        for opt in self.options:
+            cmd += ["-o", opt]
+        cmd.append(self.pdf_path)
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if res.returncode != 0:
@@ -255,6 +267,19 @@ class ThumbnailList(QListWidget):
 
 
 # ---------------------------------------------------------------------------
+#  Combobox, deren Popup-Container mitgefärbt wird
+# ---------------------------------------------------------------------------
+class StyledComboBox(QComboBox):
+    """Ohne dies zeigt Qt am aufgeklappten Popup oben/unten weiße Streifen:
+    Der Popup-Container (QFrame mit Scrollbereichen) bleibt sonst ungestylt.
+    Wir färben ihn bei jedem Öffnen passend zum Dark-Theme ein."""
+    def showPopup(self):
+        super().showPopup()
+        container = self.view().parentWidget()
+        container.setStyleSheet("background-color: #262b3b;")
+
+
+# ---------------------------------------------------------------------------
 #  Hauptfenster
 # ---------------------------------------------------------------------------
 class Kopierer(QMainWindow):
@@ -328,19 +353,19 @@ class Kopierer(QMainWindow):
         scan_form = QFormLayout(scan_box)
         scan_form.setLabelAlignment(Qt.AlignRight)
 
-        self.device_combo = QComboBox()
+        self.device_combo = StyledComboBox()
         self.device_combo.addItem("Suche Scanner …", None)
         self.device_combo.setEnabled(False)
 
-        self.res_combo = QComboBox()
+        self.res_combo = StyledComboBox()
         for r in RESOLUTIONS:
             self.res_combo.addItem(f"{r} dpi", r)
         self.res_combo.setCurrentText("300 dpi")
 
-        self.mode_combo = QComboBox()
+        self.mode_combo = StyledComboBox()
         self.mode_combo.addItems(SCAN_MODES.keys())
 
-        self.size_combo = QComboBox()
+        self.size_combo = StyledComboBox()
         self.size_combo.addItems(PAGE_SIZES.keys())
 
         scan_form.setHorizontalSpacing(12)
@@ -379,7 +404,7 @@ class Kopierer(QMainWindow):
         out_form = QFormLayout(out_box)
         out_form.setLabelAlignment(Qt.AlignRight)
 
-        self.printer_combo = QComboBox()
+        self.printer_combo = StyledComboBox()
         self.copies_spin = QSpinBox()
         self.copies_spin.setRange(1, 99)
         self.copies_spin.setValue(1)
@@ -477,9 +502,9 @@ class Kopierer(QMainWindow):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(12)
 
-        self.def_scanner_combo = QComboBox()
+        self.def_scanner_combo = StyledComboBox()
         self.def_scanner_combo.setMinimumWidth(360)
-        self.def_printer_combo = QComboBox()
+        self.def_printer_combo = StyledComboBox()
         self.def_printer_combo.setMinimumWidth(360)
         form.addRow("Standard-Scanner:", self.def_scanner_combo)
         form.addRow("Standard-Drucker:", self.def_printer_combo)
@@ -715,7 +740,8 @@ class Kopierer(QMainWindow):
             self.set_status("Kein Scanner ausgewählt.")
             return
 
-        width, height = PAGE_SIZES[self.size_combo.currentText()]
+        self._scan_fmt_name = self.size_combo.currentText()
+        width, height = PAGE_SIZES[self._scan_fmt_name]
         mode = SCAN_MODES[self.mode_combo.currentText()]
         resolution = self.res_combo.currentData()
 
@@ -742,6 +768,7 @@ class Kopierer(QMainWindow):
         icon = QIcon(pix.scaled(96, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         item = QListWidgetItem(icon, "")
         item.setData(Qt.UserRole, path)
+        item.setData(Qt.UserRole + 1, self._scan_fmt_name)   # Format der Seite
         item.setTextAlignment(Qt.AlignHCenter)
         self.thumbs.addItem(item)
         self.thumbs.setCurrentItem(item)   # zeigt sie sofort in der Vorschau
@@ -751,7 +778,7 @@ class Kopierer(QMainWindow):
             # Schnellkopie: frisch gescannte Seite direkt drucken
             self._pending_quick = False
             self.set_status("Gescannt – sende an Drucker …")
-            if not self._send_to_printer([path]):
+            if not self._send_to_printer([(path, self._scan_fmt_name)]):
                 self._set_idle()
         else:
             self._set_idle()
@@ -824,16 +851,32 @@ class Kopierer(QMainWindow):
         self._update_actions()
 
     # -- Ausgabe ------------------------------------------------------------
-    def _page_paths(self):
-        return [self.thumbs.item(i).data(Qt.UserRole)
-                for i in range(self.thumbs.count())]
+    def _page_entries(self):
+        """Liste (Pfad, Formatname) in aktueller Reihenfolge."""
+        entries = []
+        for i in range(self.thumbs.count()):
+            it = self.thumbs.item(i)
+            entries.append((it.data(Qt.UserRole), it.data(Qt.UserRole + 1)))
+        return entries
 
-    def _pdf_from(self, paths, target_path):
+    def _pdf_from(self, entries, target_path):
+        """Baut die PDF. Wenn alle Seiten dasselbe Format haben, wird die
+        PDF-Seitengröße deterministisch auf dieses Format gesetzt (unabhängig
+        von Pixelzahl/DPI) – so ist die Ausgabe echtes A4/A5/Letter."""
+        paths = [e[0] for e in entries]
+        formats = {e[1] for e in entries}
+        kwargs = {}
+        if len(formats) == 1:
+            name = next(iter(formats))
+            if name in PAGE_SIZES:
+                w_mm, h_mm = PAGE_SIZES[name]
+                kwargs["layout_fun"] = img2pdf.get_layout_fun(
+                    (img2pdf.mm_to_pt(w_mm), img2pdf.mm_to_pt(h_mm)))
         with open(target_path, "wb") as f:
-            f.write(img2pdf.convert(paths))
+            f.write(img2pdf.convert(paths, **kwargs))
 
     def _build_pdf(self, target_path):
-        self._pdf_from(self._page_paths(), target_path)
+        self._pdf_from(self._page_entries(), target_path)
 
     def _printer_or_warn(self):
         printer = self.printer_combo.currentText()
@@ -843,26 +886,35 @@ class Kopierer(QMainWindow):
             return None
         return printer
 
-    def _send_to_printer(self, paths):
-        """Baut ein PDF aus den Pfaden und schickt es an den Drucker.
+    def _send_to_printer(self, entries):
+        """Baut ein PDF aus (Pfad, Format)-Einträgen und druckt es.
         Gibt True zurück, wenn der Druckauftrag gestartet wurde."""
         printer = self._printer_or_warn()
         if not printer:
             return False
         pdf_path = os.path.join(self.tmpdir, "_druck.pdf")
         try:
-            self._pdf_from(paths, pdf_path)
+            self._pdf_from(entries, pdf_path)
         except Exception as e:
             QMessageBox.critical(self, "Fehler", str(e))
             return False
+
+        # fit-to-page + passendes Medium, damit die Seite das Blatt füllt und
+        # nicht verkleinert gedruckt wird.
+        options = ["fit-to-page"]
+        formats = {e[1] for e in entries}
+        if len(formats) == 1:
+            media = CUPS_MEDIA.get(next(iter(formats)))
+            if media:
+                options.append(f"media={media}")
 
         copies = self.copies_spin.value()
         self.scan_btn.setEnabled(False)
         self.quick_btn.setEnabled(False)
         self.print_btn.setEnabled(False)
-        self.set_status(f"Sende {len(paths)} Seite(n) an {printer} …")
+        self.set_status(f"Sende {len(entries)} Seite(n) an {printer} …")
 
-        self.print_worker = PrintWorker(pdf_path, printer, copies)
+        self.print_worker = PrintWorker(pdf_path, printer, copies, options)
         self.print_worker.finished_ok.connect(lambda: self._on_print_done(printer))
         self.print_worker.failed.connect(self._on_print_failed)
         self.print_worker.start()
@@ -888,7 +940,7 @@ class Kopierer(QMainWindow):
     def do_print(self):
         if self.thumbs.count() == 0:
             return
-        self._send_to_printer(self._page_paths())
+        self._send_to_printer(self._page_entries())
 
     def _on_print_done(self, printer):
         self._set_idle()
