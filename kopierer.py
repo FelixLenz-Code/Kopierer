@@ -1502,7 +1502,9 @@ class Kopierer(QMainWindow):
     def _pdf_from(self, entries, target_path):
         """Baut die PDF. Wenn alle Seiten dasselbe Format haben, wird die
         PDF-Seitengröße deterministisch auf dieses Format gesetzt (unabhängig
-        von Pixelzahl/DPI) – so ist die Ausgabe echtes A4/A5/Letter."""
+        von Pixelzahl/DPI) – so ist die Ausgabe echtes A4/A5/Letter.
+        `auto_orient` dreht die Seite bei quer gedrehten Scans mit, damit ein
+        Querformat-Bild nicht in eine Hochkant-Seite gequetscht wird."""
         paths = [e[0] for e in entries]
         formats = {e[1] for e in entries}
         kwargs = {}
@@ -1511,7 +1513,8 @@ class Kopierer(QMainWindow):
             if name in PAGE_SIZES:
                 w_mm, h_mm = PAGE_SIZES[name]
                 kwargs["layout_fun"] = img2pdf.get_layout_fun(
-                    (img2pdf.mm_to_pt(w_mm), img2pdf.mm_to_pt(h_mm)))
+                    (img2pdf.mm_to_pt(w_mm), img2pdf.mm_to_pt(h_mm)),
+                    auto_orient=True)
         with open(target_path, "wb") as f:
             f.write(img2pdf.convert(paths, **kwargs))
 
