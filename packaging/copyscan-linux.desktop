@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=CopyScan Linux
+Name=CopyScanLinux
 Comment=Scannen, Drucken und als PDF speichern
 Exec=copyscan-linux
 Icon=copyscan-linux
