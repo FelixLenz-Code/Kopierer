@@ -2,8 +2,9 @@
 """
 Kopierer - Scan-, Druck- und PDF-Werkzeug für Linux.
 
-Verbindet einen SANE-Flachbettscanner (z. B. Canon CanoScan 8800F) mit einem
-CUPS-Drucker, damit man wie an einem Kopierer arbeiten kann:
+Verbindet einen beliebigen SANE-Scanner (Flachbett oder mit automatischem
+Seiteneinzug/ADF) mit einem CUPS-Drucker, damit man wie an einem Kopierer
+arbeiten kann:
 Blatt einscannen  ->  Vorschau prüfen  ->  drucken und/oder als PDF speichern.
 
 Abhängigkeiten (unter Ubuntu/Debian bereits vorhanden):
@@ -15,6 +16,7 @@ Abhängigkeiten (unter Ubuntu/Debian bereits vorhanden):
 import os
 import re
 import sys
+import glob
 import shutil
 import tempfile
 import subprocess
@@ -31,12 +33,13 @@ from PyQt5.QtWidgets import (
 )
 
 # --- Papiergrößen in Millimetern (Breite x Höhe) ---------------------------
-# Der 8800F kann max. 216.069 x 297.011 mm scannen.
+# "Ganze Fläche" nutzt die volle A4-Breite; Scanner mit kleinerem oder
+# größerem Maximum beschneiden bzw. füllen das automatisch.
 PAGE_SIZES = {
     "A4 (210 × 297 mm)":     (210.0, 297.0),
     "A5 (148 × 210 mm)":     (148.0, 210.0),
     "Letter (216 × 279 mm)": (216.0, 279.0),
-    "Ganze Fläche":          (216.069, 297.011),
+    "Ganze Fläche":          (216.0, 297.0),
 }
 
 # Zuordnung Format -> CUPS-Medienname (für `lp -o media=...`)
@@ -55,6 +58,20 @@ SCAN_MODES = {
     "Schwarz/Weiß": "Lineart",
 }
 
+# Druckqualität -> IPP-Wert für `lp -o print-quality=...`
+# 3 = Entwurf, 4 = Normal, 5 = Hoch. Standardisiertes IPP-Attribut, das die
+# meisten CUPS-Treiber auf ihre eigene Auflösung/Qualität abbilden.
+PRINT_QUALITY = {
+    "Entwurf (schnell)": "3",
+    "Normal":            "4",
+    "Hoch (beste)":      "5",
+}
+
+
+def source_is_adf(name):
+    """True, wenn eine SANE-Quelle ein automatischer Einzug ist (ADF/Duplex)."""
+    return bool(name) and bool(re.search(r"adf|feeder|duplex", name, re.I))
+
 
 # ---------------------------------------------------------------------------
 #  Hintergrund-Worker
@@ -70,7 +87,7 @@ class DeviceScanWorker(QThread):
                 ["scanimage", "-L"],
                 capture_output=True, text=True, timeout=60,
             ).stdout
-            # Zeilen der Form:  device `pixma:04A91901' is a CANON Canoscan 8800F ...
+            # Zeilen der Form:  device `backend:id' is a Hersteller Modell ...
             for m in re.finditer(r"device `([^']+)' is a (.+)", out):
                 devices.append((m.group(1), m.group(2).strip()))
         except Exception:
@@ -78,76 +95,144 @@ class DeviceScanWorker(QThread):
         self.finished_ok.emit(devices)
 
 
+class SourceProbeWorker(QThread):
+    """Fragt für ein Gerät die verfügbaren Quellen (Flachbett/ADF/Duplex) ab."""
+    finished_ok = pyqtSignal(list)   # Liste von SANE-Quellnamen (Strings)
+
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+
+    def run(self):
+        sources = []
+        try:
+            out = subprocess.run(
+                ["scanimage", "-A", "-d", self.device],
+                capture_output=True, text=True, timeout=30,
+            ).stdout
+            # Zeile der Form:  --source Flatbed|Automatic Document Feeder [Flatbed]
+            m = re.search(r"--source\s+([^\[\n]+)", out)
+            if m:
+                for s in m.group(1).split("|"):
+                    s = s.strip()
+                    if s:
+                        sources.append(s)
+        except Exception:
+            pass
+        self.finished_ok.emit(sources)
+
+
+def _embed_dpi(path, resolution):
+    """Bettet die Scan-Auflösung als DPI ins PNG ein.
+
+    scanimage schreibt keine DPI-Information. Ohne sie nimmt img2pdf 96 dpi an,
+    wodurch Druck/PDF unabhängig von der gewählten Auflösung gleich aussehen.
+    Mit korrektem DPI ist die Seite physikalisch richtig groß (z. B. A4) und
+    höhere dpi = schärfer."""
+    try:
+        from PIL import Image
+        dpi = int(resolution)
+        im = Image.open(path)
+        im.load()
+        im.save(path, dpi=(dpi, dpi))
+    except (ValueError, OSError):
+        pass   # 'auto' o. Ä.: dann eben ohne DPI-Einbettung
+
+
 class ScanWorker(QThread):
-    """Scannt eine Seite nach PNG und meldet Fortschritt über stderr."""
+    """Scannt eine oder – beim automatischen Einzug (ADF) – mehrere Seiten.
+
+    Flachbett:  eine Seite mit Fortschrittsanzeige.
+    ADF/Duplex: Batch-Scan, der so lange einzieht, bis der Einzug leer ist;
+                jede fertige Seite wird sofort über `page_done` gemeldet."""
     progress = pyqtSignal(int)
-    finished_ok = pyqtSignal(str)     # Pfad zur PNG-Datei
+    page_done = pyqtSignal(str)       # Pfad je fertig gescannter Seite
+    finished_ok = pyqtSignal(int)     # Gesamtzahl der Seiten
     failed = pyqtSignal(str)
 
-    def __init__(self, device, resolution, mode, width_mm, height_mm, out_path):
+    def __init__(self, device, resolution, mode, source, width_mm, height_mm,
+                 prefix):
         super().__init__()
         self.device = device
         self.resolution = resolution
         self.mode = mode
+        self.source = source          # SANE-Quellname oder None (nicht angeben)
         self.width_mm = width_mm
         self.height_mm = height_mm
-        self.out_path = out_path
+        self.prefix = prefix          # Dateipfad-Präfix für die PNG(s)
 
-    def run(self):
+    def _base_cmd(self):
         cmd = [
             "scanimage",
             "-d", self.device,
             "--resolution", self.resolution,
             "--mode", self.mode,
-            "--source", "Flatbed",
             "--format=png",
             "-x", f"{self.width_mm}",
             "-y", f"{self.height_mm}",
-            "--progress",
         ]
+        if self.source:
+            cmd += ["--source", self.source]
+        return cmd
+
+    def run(self):
         try:
-            with open(self.out_path, "wb") as out_file:
-                proc = subprocess.Popen(
-                    cmd, stdout=out_file, stderr=subprocess.PIPE,
-                )
-                # stderr enthält "Progress: NN.N%" (mit \r getrennt)
-                buf = b""
-                while True:
-                    chunk = proc.stderr.read(64)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    for part in re.split(rb"[\r\n]", buf)[:-1]:
-                        m = re.search(rb"([\d.]+)%", part)
-                        if m:
-                            try:
-                                self.progress.emit(int(float(m.group(1))))
-                            except ValueError:
-                                pass
-                    buf = re.split(rb"[\r\n]", buf)[-1]
-                err = proc.stderr.read().decode(errors="ignore")
-                proc.wait()
-
-            if proc.returncode != 0 or not os.path.getsize(self.out_path):
-                raise RuntimeError(err or f"scanimage endete mit Code {proc.returncode}")
-
-            # scanimage schreibt keine DPI-Information ins PNG. Ohne sie nimmt
-            # img2pdf 96 dpi an, wodurch Druck/PDF unabhängig von der gewählten
-            # Auflösung gleich aussehen. Wir betten die Scan-Auflösung ein, damit
-            # die Seite physikalisch korrekt (z. B. A4) und höhere dpi = schärfer.
-            try:
-                from PIL import Image
-                dpi = int(self.resolution)
-                im = Image.open(self.out_path)
-                im.load()
-                im.save(self.out_path, dpi=(dpi, dpi))
-            except (ValueError, OSError):
-                pass   # 'auto' o. Ä.: dann eben ohne DPI-Einbettung
-
-            self.progress.emit(100)
-            self.finished_ok.emit(self.out_path)
+            if source_is_adf(self.source):
+                self._run_adf()
+            else:
+                self._run_single()
         except Exception as e:
             self.failed.emit(str(e))
+
+    def _run_single(self):
+        out_path = self.prefix + "001.png"
+        cmd = self._base_cmd() + ["--progress"]
+        with open(out_path, "wb") as out_file:
+            proc = subprocess.Popen(cmd, stdout=out_file, stderr=subprocess.PIPE)
+            # stderr enthält "Progress: NN.N%" (mit \r getrennt)
+            buf = b""
+            while True:
+                chunk = proc.stderr.read(64)
+                if not chunk:
+                    break
+                buf += chunk
+                for part in re.split(rb"[\r\n]", buf)[:-1]:
+                    m = re.search(rb"([\d.]+)%", part)
+                    if m:
+                        try:
+                            self.progress.emit(int(float(m.group(1))))
+                        except ValueError:
+                            pass
+                buf = re.split(rb"[\r\n]", buf)[-1]
+            err = proc.stderr.read().decode(errors="ignore")
+            proc.wait()
+
+        if proc.returncode != 0 or not os.path.getsize(out_path):
+            raise RuntimeError(err or f"scanimage endete mit Code {proc.returncode}")
+
+        _embed_dpi(out_path, self.resolution)
+        self.progress.emit(100)
+        self.page_done.emit(out_path)
+        self.finished_ok.emit(1)
+
+    def _run_adf(self):
+        # Batch-Modus: scanimage zieht Blatt für Blatt ein und schreibt je Seite
+        # eine Datei, bis der Einzug leer ist. Duplex-Quellen liefern automatisch
+        # doppelt so viele Seiten (Vorder-/Rückseite).
+        pattern = self.prefix + "%03d.png"
+        cmd = self._base_cmd() + [f"--batch={pattern}"]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        produced = sorted(glob.glob(self.prefix + "[0-9]" * 3 + ".png"))
+        # Verlässlicher als der Rückgabecode (SANE meldet den leeren Einzug als
+        # "Fehler"): entscheidend ist, ob mindestens eine Seite entstanden ist.
+        if not produced:
+            raise RuntimeError(
+                (res.stderr or "").strip()
+                or "Keine Seite eingezogen. Liegt Papier im Einzug?")
+        for i, p in enumerate(produced, 1):
+            _embed_dpi(p, self.resolution)
+            self.page_done.emit(p)
+        self.finished_ok.emit(len(produced))
 
 
 class PrintWorker(QThread):
@@ -365,12 +450,19 @@ class Kopierer(QMainWindow):
         self.mode_combo = StyledComboBox()
         self.mode_combo.addItems(SCAN_MODES.keys())
 
+        self.source_combo = StyledComboBox()
+        self.source_combo.addItem("Flachbett", None)
+        self.source_combo.setToolTip(
+            "Vorlagenquelle. „Automatischer Einzug“ zieht bei ADF-Scannern "
+            "alle eingelegten Blätter nacheinander ein.")
+
         self.size_combo = StyledComboBox()
         self.size_combo.addItems(PAGE_SIZES.keys())
 
         scan_form.setHorizontalSpacing(12)
         scan_form.setVerticalSpacing(10)
         scan_form.addRow("Gerät:", self.device_combo)
+        scan_form.addRow("Quelle:", self.source_combo)
         scan_form.addRow("Auflösung:", self.res_combo)
         scan_form.addRow("Modus:", self.mode_combo)
         scan_form.addRow("Format:", self.size_combo)
@@ -409,7 +501,17 @@ class Kopierer(QMainWindow):
         self.copies_spin.setRange(1, 99)
         self.copies_spin.setValue(1)
 
+        self.quality_combo = StyledComboBox()
+        for label, val in PRINT_QUALITY.items():
+            self.quality_combo.addItem(label, val)
+        # Gespeicherte Druckqualität übernehmen, sonst „Normal“
+        saved_q = self.settings.value("print_quality", "4")
+        qi = self.quality_combo.findData(saved_q)
+        self.quality_combo.setCurrentIndex(qi if qi >= 0 else 1)
+        self.quality_combo.currentIndexChanged.connect(self._on_quality_changed)
+
         out_form.addRow("Drucker:", self.printer_combo)
+        out_form.addRow("Druckqualität:", self.quality_combo)
         out_form.addRow("Exemplare:", self.copies_spin)
         sidebar.addWidget(out_box)
 
@@ -657,14 +759,9 @@ class Kopierer(QMainWindow):
             for dev_id, desc in devices:
                 self.device_combo.addItem(desc, dev_id)
                 self.def_scanner_combo.addItem(desc, dev_id)
-            # Gespeicherten Standard anwenden, sonst Canon bevorzugen
+            # Gespeicherten Standard anwenden, sonst das erste gefundene Gerät.
             saved = self.settings.value("default_scanner", "")
             idx = self.device_combo.findData(saved) if saved else -1
-            if idx < 0:
-                for i, (dev_id, _) in enumerate(devices):
-                    if "pixma" in dev_id.lower() or "canon" in dev_id.lower():
-                        idx = i
-                        break
             if idx < 0:
                 idx = 0
             self.device_combo.setCurrentIndex(idx)
@@ -673,7 +770,44 @@ class Kopierer(QMainWindow):
             self.def_scanner_combo.setEnabled(True)
             self.set_status("Scanner bereit.")
         self._loading_settings = False
+        # Quellen (Flachbett/Einzug) des aktiven Geräts abfragen
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        self._probe_sources()
         self._update_actions()
+
+    def _on_device_changed(self, _idx):
+        if not self._loading_settings:
+            self._probe_sources()
+
+    def _probe_sources(self):
+        """Fragt im Hintergrund ab, welche Quellen das gewählte Gerät anbietet."""
+        device = self.device_combo.currentData()
+        self.source_combo.setEnabled(False)
+        if not device:
+            return
+        self.src_worker = SourceProbeWorker(device)
+        self.src_worker.finished_ok.connect(self._on_sources_found)
+        self.src_worker.start()
+
+    def _on_sources_found(self, sources):
+        self.source_combo.clear()
+        if not sources:
+            # Backend meldet keine Quellen -> ohne --source scannen (Flachbett)
+            self.source_combo.addItem("Flachbett", None)
+            self.source_combo.setEnabled(False)
+            return
+        for s in sources:
+            label = s
+            if source_is_adf(s):
+                tag = "Duplex-Einzug" if "duplex" in s.lower() else "Automatischer Einzug"
+                label = f"{tag} ({s})"
+            self.source_combo.addItem(label, s)
+        self.source_combo.setEnabled(True)
+
+    def _on_quality_changed(self, _idx):
+        val = self.quality_combo.currentData()
+        if val:
+            self.settings.setValue("print_quality", val)
 
     def _load_printers(self):
         try:
@@ -744,26 +878,38 @@ class Kopierer(QMainWindow):
         width, height = PAGE_SIZES[self._scan_fmt_name]
         mode = SCAN_MODES[self.mode_combo.currentText()]
         resolution = self.res_combo.currentData()
+        source = self.source_combo.currentData()
+        is_adf = source_is_adf(source)
 
         self.page_counter += 1
-        out_path = os.path.join(self.tmpdir, f"seite_{self.page_counter:03d}.png")
+        prefix = os.path.join(self.tmpdir, f"seite_{self.page_counter:03d}_")
 
-        self.progress.setValue(0)
+        self._scanned_new = []   # Pfade der in diesem Lauf gescannten Seiten
+
+        if is_adf:
+            # ADF: Seitenzahl unbekannt -> unbestimmter Fortschritt
+            self.progress.setRange(0, 0)
+            self.set_status("Ziehe Blätter aus dem Einzug … bitte warten.")
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+            self.set_status("Scanne … bitte den Scanner nicht öffnen.")
         self.progress.show()
         self.scan_btn.setEnabled(False)
         self.quick_btn.setEnabled(False)
-        self.set_status("Scanne … bitte den Scanner nicht öffnen.")
 
-        self.scan_worker = ScanWorker(device, resolution, mode, width, height, out_path)
+        self.scan_worker = ScanWorker(device, resolution, mode, source,
+                                      width, height, prefix)
         self.scan_worker.progress.connect(self.progress.setValue)
+        self.scan_worker.page_done.connect(self._on_page_scanned)
         self.scan_worker.finished_ok.connect(self._on_scan_done)
         self.scan_worker.failed.connect(self._on_scan_failed)
         self.scan_worker.start()
 
-    def _on_scan_done(self, path):
-        self.progress.hide()
+    def _on_page_scanned(self, path):
+        """Eine (von evtl. mehreren) Seiten ist fertig -> Miniatur anlegen."""
+        self._scanned_new.append(path)
 
-        # Miniatur erzeugen
         pix = QPixmap(path)
         icon = QIcon(pix.scaled(96, 128, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         item = QListWidgetItem(icon, "")
@@ -774,17 +920,26 @@ class Kopierer(QMainWindow):
         self.thumbs.setCurrentItem(item)   # zeigt sie sofort in der Vorschau
         self._renumber()
 
+    def _on_scan_done(self, count):
+        self.progress.setRange(0, 100)
+        self.progress.hide()
+
         if self._pending_quick:
-            # Schnellkopie: frisch gescannte Seite direkt drucken
+            # Schnellkopie: die frisch gescannten Seiten direkt drucken
             self._pending_quick = False
+            entries = [(p, self._scan_fmt_name) for p in self._scanned_new]
             self.set_status("Gescannt – sende an Drucker …")
-            if not self._send_to_printer([(path, self._scan_fmt_name)]):
+            if not self._send_to_printer(entries):
                 self._set_idle()
         else:
             self._set_idle()
-            self.set_status(f"Seite {self.thumbs.count()} gescannt.")
+            if count == 1:
+                self.set_status(f"Seite {self.thumbs.count()} gescannt.")
+            else:
+                self.set_status(f"{count} Seiten aus dem Einzug gescannt.")
 
     def _on_scan_failed(self, msg):
+        self.progress.setRange(0, 100)
         self.progress.hide()
         self.page_counter -= 1
         self._pending_quick = False
@@ -907,6 +1062,10 @@ class Kopierer(QMainWindow):
             media = CUPS_MEDIA.get(next(iter(formats)))
             if media:
                 options.append(f"media={media}")
+
+        quality = self.quality_combo.currentData()
+        if quality:
+            options.append(f"print-quality={quality}")
 
         copies = self.copies_spin.value()
         self.scan_btn.setEnabled(False)
